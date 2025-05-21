@@ -1,6 +1,9 @@
 use nusb::{DeviceInfo, Interface, transfer::RequestBuffer};
 use probe_rs::probe::{DebugProbeError, ProbeCreationError};
-
+use smol::future::FutureExt;
+use smol::{Timer, block_on};
+use std::io;
+use std::time::Duration;
 const CH34X_VID_PID: [(u16, u16); 3] = [(0x1A86, 0x55DE), (0x1A86, 0x55DD), (0x1A86, 0x55E8)];
 
 pub(crate) fn is_ch34x_device(device: &DeviceInfo) -> bool {
@@ -18,6 +21,68 @@ struct CH34x {
     epout: u8,
     epin: u8,
     pack: Option<PACK>,
+}
+enum Command {
+    Clock {
+        tms: bool,
+        tdi: bool,
+        trst: bool,
+        srst: bool,
+    },
+    Reset(bool),
+}
+
+impl From<Command> for u8 {
+    fn from(value: Command) -> Self {
+        match value {
+            Command::Reset(x) => u8::from(Command::Clock {
+                tms: true,
+                tdi: true,
+                trst: x,
+                srst: false,
+            }),
+            Command::Clock {
+                tms,
+                tdi,
+                trst,
+                srst,
+            } => {
+                (u8::from(tms) << 1)
+                    | (u8::from(tdi) << 4)
+                    | (u8::from(trst) << 5)
+                    | u8::from(srst) << 6
+                    | 0
+            }
+        }
+    }
+}
+
+impl Command {
+    fn new(tms: bool, tdi: bool) -> Self {
+        Command::Clock {
+            tms,
+            tdi,
+            trst: false,
+            srst: false,
+        }
+    }
+}
+
+struct ClockBuilder {
+    buf: Vec<u8>,
+}
+
+impl ClockBuilder {
+    fn new() -> Self {
+        Self { buf: Vec::new() }
+    }
+    fn add(mut self, command: Command) -> Self {
+        let left = u8::from(command);
+        let right = u8::from(left | 0x01);
+        self.buf.push(left);
+        self.buf.push(right);
+        self
+    }
 }
 
 impl CH34x {
@@ -91,16 +156,7 @@ impl CH34x {
             }
         }
 
-        self.set_speed(15000).expect("Set speed error");
-    }
-
-    fn send(&self, data: Vec<u8>) -> bool {
-        match smol::block_on(self.device.bulk_out(self.epout, data)).into_result() {
-            Err(_) => return false,
-            _ => {}
-        }
-
-        return true;
+        self.set_speed(60000).expect("Set speed error");
     }
 
     fn set_speed(&mut self, speed_khz: u32) -> Result<u32, DebugProbeError> {
@@ -158,35 +214,61 @@ impl CH34x {
         }
         Ok(index)
     }
+
+    fn send(&self, buf: &[u8]) {
+        let mut out = vec![0xd2u8];
+        let low = (buf.len() % 255) as u8;
+        out.push(low);
+        out.push(0);
+        out.extend_from_slice(buf);
+        let mut rev = [0; 64];
+        self.device
+            .write_bulk(self.epout, &out, Duration::from_millis(500))
+            .expect("send error");
+
+        self.device
+            .read_bulk(self.epin, &mut rev, Duration::from_millis(500))
+            .expect("read error");
+
+        log::info!("rev: {:?}", rev);
+    }
 }
 
-enum Command {
-    Clock {
-        tms: bool,
-        tdi: bool,
-        trst: bool,
-        srst: bool,
-    },
+pub trait InterfaceExt {
+    fn read_bulk(&self, endpoint: u8, buf: &mut [u8], timeout: Duration) -> io::Result<usize>;
+    fn write_bulk(&self, endpoint: u8, buf: &[u8], timeout: Duration) -> io::Result<usize>;
 }
 
-impl From<Command> for Vec<u8> {
-    fn from(value: Command) -> Self {
-        match value {
-            Command::Clock {
-                tms,
-                tdi,
-                trst,
-                srst,
-            } => {
-                let low = (u8::from(tms) << 1
-                    | u8::from(tdi) << 4
-                    | u8::from(trst) << 5
-                    | u8::from(srst) << 6
-                    | 0u8);
-                let hight = low | 1u8;
-                vec![low, hight]
-            }
-        }
+impl InterfaceExt for Interface {
+    fn write_bulk(&self, endpoint: u8, buf: &[u8], timeout: Duration) -> io::Result<usize> {
+        let fut = async {
+            let comp = self.bulk_out(endpoint, buf.to_vec()).await;
+            comp.status.map_err(io::Error::other)?;
+
+            let n = comp.data.actual_length();
+            Ok(n)
+        };
+
+        block_on(fut.or(async {
+            Timer::after(timeout).await;
+            Err(std::io::ErrorKind::TimedOut.into())
+        }))
+    }
+
+    fn read_bulk(&self, endpoint: u8, buf: &mut [u8], timeout: Duration) -> io::Result<usize> {
+        let fut = async {
+            let comp = self.bulk_in(endpoint, RequestBuffer::new(buf.len())).await;
+            comp.status.map_err(io::Error::other)?;
+
+            let n = comp.data.len();
+            buf[..n].copy_from_slice(&comp.data);
+            Ok(n)
+        };
+
+        block_on(fut.or(async {
+            Timer::after(timeout).await;
+            Err(std::io::ErrorKind::TimedOut.into())
+        }))
     }
 }
 
@@ -194,4 +276,5 @@ fn main() {
     env_logger::init();
     let mut ch34x = CH34x::new_from_selector().expect("Not found ch34x device");
     ch34x.ch347_jtag_init();
+    ch34x.send(&[0x10, 0x11, 0x10, 0x12, 0x13, 0x12]);
 }
